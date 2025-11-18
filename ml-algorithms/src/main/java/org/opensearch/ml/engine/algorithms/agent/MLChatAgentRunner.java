@@ -14,7 +14,6 @@ import static org.opensearch.ml.common.utils.ToolUtils.getToolName;
 import static org.opensearch.ml.common.utils.ToolUtils.parseResponse;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.DISABLE_TRACE;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.INTERACTIONS_PREFIX;
-import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.LLM_RESPONSE_FILTER;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.PROMPT_CHAT_HISTORY_PREFIX;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.PROMPT_PREFIX;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.PROMPT_SUFFIX;
@@ -36,7 +35,6 @@ import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.outputToOutpu
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.parseLLMOutput;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.substitute;
 import static org.opensearch.ml.engine.algorithms.agent.PromptTemplate.CHAT_HISTORY_PREFIX;
-import static org.opensearch.ml.engine.algorithms.agent.PromptTemplate.SUMMARY_PROMPT_TEMPLATE;
 import static org.opensearch.ml.engine.tools.ReadFromScratchPadTool.SCRATCHPAD_NOTES_KEY;
 
 import java.security.PrivilegedActionException;
@@ -1072,92 +1070,19 @@ public class MLChatAgentRunner implements MLAgentRunner {
             listener.onFailure(new IllegalArgumentException("Steps summary cannot be null or empty"));
             return;
         }
-
-        try {
-            Map<String, String> summaryParams = new HashMap<>();
-            if (llmSpec.getParameters() != null) {
-                summaryParams.putAll(llmSpec.getParameters());
-            }
-
-            // Convert ModelTensors to strings before joining
-            List<String> stepStrings = new ArrayList<>();
-            for (ModelTensors tensor : stepsSummary) {
-                if (tensor != null && tensor.getMlModelTensors() != null) {
-                    for (ModelTensor modelTensor : tensor.getMlModelTensors()) {
-                        if (modelTensor.getResult() != null) {
-                            stepStrings.add(modelTensor.getResult());
-                        } else if (modelTensor.getDataAsMap() != null && modelTensor.getDataAsMap().containsKey("response")) {
-                            stepStrings.add(String.valueOf(modelTensor.getDataAsMap().get("response")));
-                        }
+        List<String> stepStrings = new ArrayList<>();
+        for (ModelTensors tensor : stepsSummary) {
+            if (tensor != null && tensor.getMlModelTensors() != null) {
+                for (ModelTensor modelTensor : tensor.getMlModelTensors()) {
+                    if (modelTensor.getResult() != null) {
+                        stepStrings.add(modelTensor.getResult());
+                    } else if (modelTensor.getDataAsMap() != null && modelTensor.getDataAsMap().containsKey("response")) {
+                        stepStrings.add(String.valueOf(modelTensor.getDataAsMap().get("response")));
                     }
                 }
             }
-            String summaryPrompt = String.format(Locale.ROOT, SUMMARY_PROMPT_TEMPLATE, String.join("\n", stepStrings));
-            summaryParams.put(PROMPT, summaryPrompt);
-            summaryParams.putIfAbsent(SYSTEM_PROMPT_FIELD, SUMMARY_PROMPT_TEMPLATE);
-
-            ActionRequest request = new MLPredictionTaskRequest(
-                llmSpec.getModelId(),
-                RemoteInferenceMLInput
-                    .builder()
-                    .algorithm(FunctionName.REMOTE)
-                    .inputDataset(RemoteInferenceInputDataSet.builder().parameters(summaryParams).build())
-                    .build(),
-                null,
-                tenantId
-            );
-            client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(response -> {
-                String summary = extractSummaryFromResponse(response);
-                if (summary == null) {
-                    listener.onFailure(new RuntimeException("Empty or invalid LLM summary response"));
-                    return;
-                }
-                listener.onResponse(summary);
-            }, listener::onFailure));
-        } catch (Exception e) {
-            listener.onFailure(e);
         }
-    }
-
-    public String extractSummaryFromResponse(MLTaskResponse response) {
-        try {
-            ModelTensorOutput output = (ModelTensorOutput) response.getOutput();
-            if (output == null || output.getMlModelOutputs() == null || output.getMlModelOutputs().isEmpty()) {
-                return null;
-            }
-
-            ModelTensors tensors = output.getMlModelOutputs().getFirst();
-            if (tensors == null || tensors.getMlModelTensors() == null || tensors.getMlModelTensors().isEmpty()) {
-                return null;
-            }
-
-            ModelTensor tensor = tensors.getMlModelTensors().getFirst();
-            if (tensor.getResult() != null) {
-                return tensor.getResult().trim();
-            }
-
-            if (tensor.getDataAsMap() == null) {
-                return null;
-            }
-
-            Map<String, ?> dataMap = tensor.getDataAsMap();
-            if (dataMap.containsKey("response")) {
-                return String.valueOf(dataMap.get("response")).trim();
-            }
-
-            if (dataMap.containsKey("output")) {
-                Object outputObj = JsonPath.read(dataMap, LLM_RESPONSE_FILTER);
-                if (outputObj != null) {
-                    return String.valueOf(outputObj).trim();
-                }
-            }
-
-            log.error("Summary generate error. No result/response field found. Available fields: {}", dataMap.keySet());
-            return null;
-        } catch (Exception e) {
-            log.error("Failed to extract summary from response", e);
-            throw new RuntimeException("Failed to extract summary from response", e);
-        }
+        AgentUtils.generateSummary(client, llmSpec, stepStrings, tenantId, null, listener);
     }
 
     private void saveMessage(

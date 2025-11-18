@@ -768,108 +768,30 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
             );
         }, finalListener::onFailure);
 
-        generateSummary(llm, completedSteps, allParams.get(TENANT_ID_FIELD), ActionListener.wrap(summary -> {
-            log.info("Summary generated successfully");
+        String fallbackResult = generateFallbackResult(maxSteps, completedSteps);
+        AgentUtils.generateSummary(client, llm, completedSteps, allParams.get(TENANT_ID_FIELD), allParams, ActionListener.wrap(summary -> {
             responseListener
                 .onResponse(
                     String.format("Max Steps Limit (%d) Reached. Here's a summary of the steps completed so far:\n\n%s", maxSteps, summary)
                 );
         }, e -> {
             log.error("Summary generation failed, using fallback", e);
-            String fallbackResult = completedSteps.isEmpty() || completedSteps.size() < 2
-                ? String.format("Max Steps Limit (%d) Reached. Use memory_id with same task to restart.", maxSteps)
-                : String
-                    .format(
-                        "Max Steps Limit (%d) Reached. Use memory_id with same task to restart. \n "
-                            + "Last executed step: %s, \n "
-                            + "Last executed step result: %s",
-                        maxSteps,
-                        completedSteps.get(completedSteps.size() - 2),
-                        completedSteps.getLast()
-                    );
             responseListener.onResponse(fallbackResult);
         }));
     }
 
-    private void generateSummary(LLMSpec llmSpec, List<String> completedSteps, String tenantId, ActionListener<String> listener) {
-        if (completedSteps == null || completedSteps.isEmpty()) {
-            listener.onFailure(new IllegalArgumentException("Completed steps cannot be null or empty"));
-            return;
-        }
-
-        try {
-            Map<String, String> summaryParams = new HashMap<>();
-            if (llmSpec.getParameters() != null) {
-                summaryParams.putAll(llmSpec.getParameters());
-            }
-
-            String summaryPrompt = String.format(Locale.ROOT, SUMMARY_PROMPT_TEMPLATE, String.join("\n", completedSteps));
-            summaryParams.put(PROMPT_FIELD, summaryPrompt);
-            summaryParams.putIfAbsent(SYSTEM_PROMPT_FIELD, SUMMARY_PROMPT_TEMPLATE);
-
-            MLPredictionTaskRequest request = new MLPredictionTaskRequest(
-                llmSpec.getModelId(),
-                RemoteInferenceMLInput
-                    .builder()
-                    .algorithm(FunctionName.REMOTE)
-                    .inputDataset(RemoteInferenceInputDataSet.builder().parameters(summaryParams).build())
-                    .build(),
-                null,
-                tenantId
-            );
-
-            client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(response -> {
-                String summary = extractSummaryFromResponse(response);
-                if (summary == null || summary.trim().isEmpty()) {
-                    log.error("Extracted summary is empty");
-                    listener.onFailure(new RuntimeException("Empty or invalid LLM summary response"));
-                    return;
-                }
-                listener.onResponse(summary);
-            }, listener::onFailure));
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
-    }
-
-    private String extractSummaryFromResponse(MLTaskResponse response) {
-        try {
-            ModelTensorOutput output = (ModelTensorOutput) response.getOutput();
-            if (output == null || output.getMlModelOutputs() == null || output.getMlModelOutputs().isEmpty()) {
-                return null;
-            }
-
-            ModelTensors tensors = output.getMlModelOutputs().getFirst();
-            if (tensors == null || tensors.getMlModelTensors() == null || tensors.getMlModelTensors().isEmpty()) {
-                return null;
-            }
-
-            ModelTensor tensor = tensors.getMlModelTensors().getFirst();
-            if (tensor.getResult() != null) {
-                return tensor.getResult().trim();
-            }
-
-            if (tensor.getDataAsMap() == null) {
-                return null;
-            }
-
-            Map<String, ?> dataMap = tensor.getDataAsMap();
-            if (dataMap.containsKey(RESPONSE_FIELD)) {
-                return String.valueOf(dataMap.get(RESPONSE_FIELD)).trim();
-            }
-
-            if (dataMap.containsKey("output")) {
-                Object outputObj = JsonPath.read(dataMap, LLM_RESPONSE_FILTER);
-                if (outputObj != null) {
-                    return String.valueOf(outputObj).trim();
-                }
-            }
-
-            log.error("Summary generate error. No result/response field found. Available fields: {}", dataMap.keySet());
-            return null;
-        } catch (Exception e) {
-            log.error("Summary extraction failed", e);
-            throw new RuntimeException("Failed to extract summary from response", e);
-        }
+    @VisibleForTesting
+    String generateFallbackResult(int maxSteps, List<String> completedSteps) {
+        return completedSteps.isEmpty() || completedSteps.size() < 2
+            ? String.format("Max Steps Limit (%d) Reached. Use memory_id with same task to restart.", maxSteps)
+            : String
+                .format(
+                    "Max Steps Limit (%d) Reached. Use memory_id with same task to restart. \n "
+                        + "Last executed step: %s, \n "
+                        + "Last executed step result: %s",
+                    maxSteps,
+                    completedSteps.get(completedSteps.size() - 2),
+                    completedSteps.getLast()
+                );
     }
 }

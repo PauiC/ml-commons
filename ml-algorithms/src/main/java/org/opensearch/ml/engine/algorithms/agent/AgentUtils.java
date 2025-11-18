@@ -33,6 +33,7 @@ import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.TOOL_D
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.TOOL_NAMES;
 import static org.opensearch.ml.engine.algorithms.agent.MLPlanExecuteAndReflectAgentRunner.RESPONSE_FIELD;
 import static org.opensearch.ml.engine.algorithms.agent.MLPlanExecuteAndReflectAgentRunner.TENANT_ID_FIELD;
+import static org.opensearch.ml.engine.algorithms.agent.PromptTemplate.SUMMARY_PROMPT_TEMPLATE;
 import static org.opensearch.ml.engine.memory.ConversationIndexMemory.APP_TYPE;
 import static org.opensearch.ml.engine.memory.ConversationIndexMemory.LAST_N_INTERACTIONS;
 
@@ -75,6 +76,8 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.ml.common.FunctionName;
+import org.opensearch.ml.common.agent.LLMSpec;
 import org.opensearch.ml.common.agent.MLAgent;
 import org.opensearch.ml.common.agent.MLMemorySpec;
 import org.opensearch.ml.common.agent.MLToolSpec;
@@ -82,9 +85,15 @@ import org.opensearch.ml.common.connector.Connector;
 import org.opensearch.ml.common.connector.HttpConnector;
 import org.opensearch.ml.common.connector.McpConnector;
 import org.opensearch.ml.common.connector.McpStreamableHttpConnector;
+import org.opensearch.ml.common.dataset.remote.RemoteInferenceInputDataSet;
+import org.opensearch.ml.common.input.remote.RemoteInferenceMLInput;
 import org.opensearch.ml.common.output.model.ModelTensor;
 import org.opensearch.ml.common.output.model.ModelTensorOutput;
+import org.opensearch.ml.common.output.model.ModelTensors;
 import org.opensearch.ml.common.spi.tools.Tool;
+import org.opensearch.ml.common.transport.MLTaskResponse;
+import org.opensearch.ml.common.transport.prediction.MLPredictionTaskAction;
+import org.opensearch.ml.common.transport.prediction.MLPredictionTaskRequest;
 import org.opensearch.ml.common.utils.StringUtils;
 import org.opensearch.ml.engine.MLEngineClassLoader;
 import org.opensearch.ml.engine.algorithms.remote.McpConnectorExecutor;
@@ -1124,4 +1133,100 @@ public class AgentUtils {
             return null;
         }
     }
+
+    public static void generateSummary(
+            Client client,
+            LLMSpec llmSpec,
+            List<String> steps,
+            String tenantId,
+            Map<String, String> additionalParams,
+            ActionListener<String> listener
+    ) {
+        if (steps == null || steps.isEmpty()) {
+            listener.onFailure(new IllegalArgumentException("Steps cannot be null or empty"));
+            return;
+        }
+
+        try {
+            Map<String, String> summaryParams = new HashMap<>();
+            if (llmSpec.getParameters() != null) {
+                summaryParams.putAll(llmSpec.getParameters());
+            }
+            if (additionalParams != null && additionalParams.containsKey(LLM_RESPONSE_FILTER)) {
+                summaryParams.put(LLM_RESPONSE_FILTER, additionalParams.get(LLM_RESPONSE_FILTER));
+            }
+
+            String summaryPrompt = String.format(Locale.ROOT, SUMMARY_PROMPT_TEMPLATE, String.join("\n", steps));
+            summaryParams.put("prompt", summaryPrompt);
+            summaryParams.putIfAbsent("system_prompt", SUMMARY_PROMPT_TEMPLATE);
+
+            MLPredictionTaskRequest request = new MLPredictionTaskRequest(
+                    llmSpec.getModelId(),
+                    RemoteInferenceMLInput
+                            .builder()
+                            .algorithm(FunctionName.REMOTE)
+                            .inputDataset(RemoteInferenceInputDataSet.builder().parameters(summaryParams).build())
+                            .build(),
+                    null,
+                    tenantId
+            );
+
+            client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(response -> {
+                try {
+                    String summary = extractSummaryFromResponse(response, summaryParams);
+                    listener.onResponse(summary);
+                } catch (Exception e) {
+                    log.error("Failed to extract summary, triggering fallback", e);
+                    listener.onFailure(e);
+                }
+            }, listener::onFailure));
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    public static String extractSummaryFromResponse(MLTaskResponse response, Map<String, String> parameters) {
+        try {
+            ModelTensorOutput output = (ModelTensorOutput) response.getOutput();
+            if (output == null || output.getMlModelOutputs() == null || output.getMlModelOutputs().isEmpty()) {
+                log.error("Summary generation failed: output is null or empty");
+                throw new IllegalStateException("Unable to generate summary: output is null or empty");
+            }
+
+            ModelTensors tensors = output.getMlModelOutputs().getFirst();
+            if (tensors == null || tensors.getMlModelTensors() == null || tensors.getMlModelTensors().isEmpty()) {
+                log.error("Summary generation failed: tensors are null or empty");
+                throw new IllegalStateException("Unable to generate summary: tensors are null or empty");
+            }
+
+            ModelTensor tensor = tensors.getMlModelTensors().getFirst();
+            if (tensor.getResult() != null) {
+                return tensor.getResult().trim();
+            }
+
+            if (tensor.getDataAsMap() == null) {
+                log.error("Summary generation failed: dataAsMap is null");
+                throw new IllegalStateException("Unable to generate summary: dataAsMap is null");
+            }
+
+            Map<String, ?> dataMap = tensor.getDataAsMap();
+            if (dataMap.containsKey(RESPONSE_FIELD)) {
+                return String.valueOf(dataMap.get(RESPONSE_FIELD)).trim();
+            }
+
+            if (parameters.containsKey(LLM_RESPONSE_FILTER) && dataMap.containsKey("output")) {
+                Object outputObj = JsonPath.read(dataMap, parameters.get(LLM_RESPONSE_FILTER));
+                if (outputObj != null) {
+                    return String.valueOf(outputObj).trim();
+                }
+            }
+
+            log.error("Summary generate error. No result/response field found. Available fields: {}", dataMap.keySet());
+            throw new IllegalStateException("Unable to generate summary: no result/response field found");
+        } catch (Exception e) {
+            log.error("Failed to extract summary from response", e);
+            throw new IllegalStateException("Failed to extract summary from response", e);
+        }
+    }
+
 }
